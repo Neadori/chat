@@ -67,27 +67,29 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversations = get_open_conversations()
     
     if not conversations:
-        await update.message.reply_text("Не удалось получить тикеты из Chatwoot (смотри логи)")
+        await update.message.reply_text("Не удалось получить тикеты из Chatwoot")
         return
 
     stats: Dict[str, int] = {}
-    unassigned = 0
 
     for conv in conversations:
         assignee = conv.get("meta", {}).get("assignee")
         if assignee:
             name = assignee.get("name", "Без имени")
             stats[name] = stats.get(name, 0) + 1
-        else:
-            unassigned += 1
 
-    lines = ["📊 <b>Открытые тикеты:</b>\n"]
-    for name, count in sorted(stats.items(), key=lambda x: -x[1]):
-        lines.append(f"• {name}: <b>{count}</b>")
-    if unassigned:
-        lines.append(f"• Не назначены: <b>{unassigned}</b>")
-    lines.append(f"\nВсего: <b>{sum(stats.values()) + unassigned}</b>")
+    total = sum(stats.values())
+
+    if total == 0:
+        await update.message.reply_text("Нет открытых назначенных тикетов 🎉")
+        return
+
+    lines = [f"📊 <b>Открытые тикеты ({total}):</b>\n"]
     
+    for name, count in sorted(stats.items(), key=lambda x: -x[1]):
+        percent = round(count / total * 100)
+        lines.append(f"• {name}: <b>{count}</b> ({percent}%)")
+
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
