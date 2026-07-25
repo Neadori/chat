@@ -40,60 +40,86 @@ headers = {
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
-def fetch_conversations_by_status(status: str) -> List[dict]:
-    """Получает ВСЕ диалоги по статусу, полностью проходя по всем страницам пагинации."""
+def fetch_conversations_paginated(status: str) -> List[dict]:
+    """Глубокий сбор диалогов с явным проходом по страницам."""
     url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations"
-    page = 1
     conversations = []
+    page = 1
 
     while True:
         params = {"status": status, "assignee_type": "all", "page": page}
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code != 200:
-                logger.error(f"Chatwoot error for status {status}: {resp.status_code} - {resp.text}")
+                logger.error(f"Chatwoot error ({status}, page {page}): {resp.status_code}")
                 break
 
             data = resp.json()
-            # Обработка разных структур ответа Chatwoot
             payload = []
-            meta = {}
             
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], dict):
                     payload = data["data"].get("payload", [])
-                    meta = data["data"].get("meta", {})
                 elif "payload" in data:
                     payload = data.get("payload", [])
-                    meta = data.get("meta", {})
-            
+            elif isinstance(data, list):
+                payload = data
+
             if not payload:
                 break
 
             conversations.extend(payload)
-
-            # Проверяем наличие следующей страницы
-            next_page = meta.get("next_page") or meta.get("pages_count", 0) > page
-            if not next_page:
-                break
-            
             page += 1
 
+            # Ограничитель предосторожности от бесконечного цикла
+            if page > 50:
+                break
+
         except Exception as e:
-            logger.error(f"Error fetching conversations ({status}, page {page}): {e}")
+            logger.error(f"Error fetching page {page} for {status}: {e}")
             break
 
     return conversations
 
 
-def get_all_conversations() -> List[dict]:
-    """Собирает открытые, завершённые и ожидания тикеты без дубликатов."""
+def get_agent_stats_from_api() -> Dict[str, int]:
+    """
+    Пытается получить точную статистику напрямую через Reports API Chatwoot.
+    Если недоступно — использует полный обход списка диалогов.
+    """
+    url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/reports/agents"
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            reports = resp.json()
+            stats = {}
+            for agent_data in reports:
+                agent = agent_data.get("agent", {})
+                name = agent.get("name") or agent.get("available_name")
+                # Суммируем обработанные тикеты
+                metric_count = agent_data.get("conversations_count", 0)
+                if name and metric_count > 0:
+                    stats[name] = metric_count
+            if stats:
+                return stats
+    except Exception as e:
+        logger.warning(f"Reports API unavailable, falling back to direct fetching: {e}")
+
+    # Резервный метод: сбор диалогов вручную
     all_convs = []
-    for status in ["open", "resolved", "pending"]:
-        all_convs.extend(fetch_conversations_by_status(status))
+    for st in ["open", "resolved", "pending"]:
+        all_convs.extend(fetch_conversations_paginated(st))
     
-    unique_convs = {conv["id"]: conv for conv in all_convs}
-    return list(unique_convs.values())
+    unique_convs = {c["id"]: c for c in all_convs}
+    
+    stats: Dict[str, int] = {}
+    for conv in unique_convs.values():
+        assignee = conv.get("meta", {}).get("assignee")
+        if assignee:
+            name = assignee.get("name", "Без имени").strip()
+            stats[name] = stats.get(name, 0) + 1
+
+    return stats
 
 
 def get_conversation_messages(conversation_id: int):
@@ -109,7 +135,7 @@ def get_conversation_messages(conversation_id: int):
 
 async def check_waiting_tickets():
     logger.info("Checking waiting tickets...")
-    conversations = fetch_conversations_by_status("open")
+    conversations = fetch_conversations_paginated("open")
     now = datetime.now(timezone.utc)
 
     for conv in conversations:
@@ -157,31 +183,27 @@ async def check_waiting_tickets():
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conversations = get_all_conversations()
+    stats = get_agent_stats_from_api()
+
+    if not stats:
+        await update.message.reply_text("Назначенных тикетов не найдено.", parse_mode="HTML")
+        return
+
+    # Находим максимальное количество тикетов у одного оператора (принимаем за 100%)
+    max_tickets = max(stats.values())
+    total_assigned = sum(stats.values())
+
+    lines = ["📊 <b>Статистика по операторам (активные + завершённые):</b>\n"]
     
-    stats: Dict[str, int] = {}
-    total_assigned_tickets = 0
+    sorted_stats = sorted(stats.items(), key=lambda x: -x[1])
+    
+    for name, count in sorted_stats:
+        # Расчет процента относительно лидера
+        relative_pct = (count / max_tickets) * 100 if max_tickets > 0 else 0
+        lines.append(f"• <b>{name}</b>: <b>{count}</b> ({relative_pct:.1f}%)")
 
-    for conv in conversations:
-        assignee = conv.get("meta", {}).get("assignee")
-        if assignee:
-            name = assignee.get("name", "Без имени").strip()
-            stats[name] = stats.get(name, 0) + 1
-            total_assigned_tickets += 1
-
-    if total_assigned_tickets == 0:
-        text = "Назначенных тикетов не найдено."
-    else:
-        lines = ["📊 <b>Общая статистика (активные + завершённые):</b>\n"]
-        
-        sorted_stats = sorted(stats.items(), key=lambda x: -x[1])
-        
-        for name, count in sorted_stats:
-            percentage = (count / total_assigned_tickets) * 100
-            lines.append(f"• <b>{name}</b>: <b>{count}</b> ({percentage:.1f}%)")
-
-        lines.append(f"\nВсего назначенных тикетов: <b>{total_assigned_tickets}</b>")
-        text = "\n".join(lines)
+    lines.append(f"\nВсего обработано тикетов: <b>{total_assigned}</b>")
+    text = "\n".join(lines)
 
     await update.message.reply_text(text, parse_mode="HTML")
 
