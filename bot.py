@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Set, Any
+from typing import Dict, Set
 
 import requests
 from fastapi import FastAPI, Request, Response
@@ -18,7 +18,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "1498669791")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://chat-2qjr.onrender.com")
 
-WAITING_MINUTES = 10
+WAITING_MINUTES = 10       # Время ожидания для всех по умолчанию (мин)
+IRA_WAITING_MINUTES = 5    # Время ожидания для Иры (мин)
 CHECK_INTERVAL = 60
 # =================================================
 
@@ -86,7 +87,6 @@ def get_conversation_messages(conversation_id: int):
 
 async def check_waiting_tickets():
     logger.info("Checking waiting tickets...")
-    # Для алертов проверяем только открытые тикеты
     conversations = get_conversations(status="open")
     now = datetime.now(timezone.utc)
 
@@ -96,6 +96,10 @@ async def check_waiting_tickets():
         contact_name = conv.get("meta", {}).get("sender", {}).get("name", "Клиент")
         assignee = conv.get("meta", {}).get("assignee")
         assignee_name = assignee.get("name") if assignee else "Не назначен"
+
+        # Определение лимита ожидания (5 мин для Иры, 10 мин для остальных)
+        is_ira = "ира" in assignee_name.lower() or "ira" in assignee_name.lower()
+        required_wait_minutes = IRA_WAITING_MINUTES if is_ira else WAITING_MINUTES
 
         messages = get_conversation_messages(conv_id)
         if not messages:
@@ -112,7 +116,7 @@ async def check_waiting_tickets():
             msg_time = datetime.fromtimestamp(created_at, tz=timezone.utc)
             minutes_waiting = (now - msg_time).total_seconds() / 60
 
-            if minutes_waiting >= WAITING_MINUTES and conv_id not in already_notified:
+            if minutes_waiting >= required_wait_minutes and conv_id not in already_notified:
                 text = (
                     f"⚠️ <b>Тикет ждёт ответа уже {int(minutes_waiting)} мин.</b>\n\n"
                     f"Клиент: <b>{contact_name}</b>\n"
@@ -132,33 +136,18 @@ async def check_waiting_tickets():
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Получаем абсолютно все тикеты (open, resolved, pending)
     conversations = get_conversations(status="all")
     
-    # Структура: { "Имя": {"open": 0, "resolved": 0, "total": 0} }
-    stats: Dict[str, Dict[str, int]] = {}
-    unassigned_open = 0
-    unassigned_resolved = 0
+    stats: Dict[str, int] = {}
+    unassigned = 0
 
     for conv in conversations:
-        status = conv.get("status", "open")
         assignee = conv.get("meta", {}).get("assignee")
-
         if assignee:
             name = assignee.get("name", "Без имени")
-            if name not in stats:
-                stats[name] = {"open": 0, "resolved": 0, "total": 0}
-            
-            stats[name]["total"] += 1
-            if status == "resolved":
-                stats[name]["resolved"] += 1
-            else:
-                stats[name]["open"] += 1
+            stats[name] = stats.get(name, 0) + 1
         else:
-            if status == "resolved":
-                unassigned_resolved += 1
-            else:
-                unassigned_open += 1
+            unassigned += 1
 
     total_tickets = len(conversations)
 
@@ -167,22 +156,17 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines = ["📊 <b>Статистика по всем тикетам:</b>\n"]
         
-        # Сортируем по общему количеству тикетов
-        sorted_stats = sorted(stats.items(), key=lambda x: -x[1]["total"])
+        sorted_stats = sorted(stats.items(), key=lambda x: -x[1])
         
-        for name, counts in sorted_stats:
-            lines.append(
-                f"• <b>{name}</b>: Всего <b>{counts['total']}</b> "
-                f"(🟢 Открыто: {counts['open']} | ✅ Закрыто: {counts['resolved']})"
-            )
+        for name, count in sorted_stats:
+            percentage = (count / total_tickets) * 100
+            lines.append(f"• <b>{name}</b>: <b>{count}</b> ({percentage:.1f}%)")
 
-        if unassigned_open or unassigned_resolved:
-            lines.append(
-                f"\n• <b>Не назначены</b>: "
-                f"(🟢 Открыто: {unassigned_open} | ✅ Закрыто: {unassigned_resolved})"
-            )
+        if unassigned:
+            unassigned_pct = (unassigned / total_tickets) * 100
+            lines.append(f"• <b>Не назначены</b>: <b>{unassigned}</b> ({unassigned_pct:.1f}%)")
 
-        lines.append(f"\nВсего тикетов в базе: <b>{total_tickets}</b>")
+        lines.append(f"\nВсего тикетов: <b>{total_tickets}</b>")
         text = "\n".join(lines)
 
     await update.message.reply_text(text, parse_mode="HTML")
@@ -192,7 +176,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот мониторинга Chatwoot.\n\n"
         "Команды:\n"
-        "/stats — сводка по всем тикетам (открытым и закрытым)"
+        "/stats — сводка по всем тикетам"
     )
 
 
