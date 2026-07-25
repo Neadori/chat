@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Set, List
@@ -18,9 +19,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "1498669791")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://chat-2qjr.onrender.com")
 
-WAITING_MINUTES = 10       # Время ожидания для всех по умолчанию (мин)
+WAITING_MINUTES = 10       # Время ожидания для всех (мин)
 IRA_WAITING_MINUTES = 5    # Время ожидания для Иры (мин)
 CHECK_INTERVAL = 60
+STATS_FILE = "daily_stats.json"
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -39,9 +41,39 @@ headers = {
 
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+# ================== РАБОТА С БАЗОЙ ДАННЫХ ДНЯ ==================
+def load_daily_data() -> dict:
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("date") == today_str:
+                    return data
+        except Exception as e:
+            logger.error(f"Error loading stats file: {e}")
+    return {"date": today_str, "assigned": {}}
 
+def save_daily_data(data: dict):
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving stats file: {e}")
+
+def record_conversation_assignee(conv_id: int, assignee_name: str):
+    if not assignee_name or assignee_name in ["Не назначен", "Без имени"]:
+        return
+    data = load_daily_data()
+    conv_str = str(conv_id)
+    # Если за день оператора у этого тикета еще не фиксировали
+    if data["assigned"].get(conv_str) != assignee_name:
+        data["assigned"][conv_str] = assignee_name
+        save_daily_data(data)
+        logger.info(f"Recorded ticket #{conv_id} for operator '{assignee_name}'")
+
+# ================== CHATWOOT API ==================
 def fetch_conversations_paginated(status: str) -> List[dict]:
-    """Глубокий сбор диалогов с явным проходом по страницам."""
     url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations"
     conversations = []
     page = 1
@@ -51,7 +83,6 @@ def fetch_conversations_paginated(status: str) -> List[dict]:
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code != 200:
-                logger.error(f"Chatwoot error ({status}, page {page}): {resp.status_code}")
                 break
 
             data = resp.json()
@@ -70,57 +101,13 @@ def fetch_conversations_paginated(status: str) -> List[dict]:
 
             conversations.extend(payload)
             page += 1
-
-            # Ограничитель предосторожности от бесконечного цикла
             if page > 50:
                 break
-
         except Exception as e:
-            logger.error(f"Error fetching page {page} for {status}: {e}")
+            logger.error(f"Error fetching page {page}: {e}")
             break
 
     return conversations
-
-
-def get_agent_stats_from_api() -> Dict[str, int]:
-    """
-    Пытается получить точную статистику напрямую через Reports API Chatwoot.
-    Если недоступно — использует полный обход списка диалогов.
-    """
-    url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/reports/agents"
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            reports = resp.json()
-            stats = {}
-            for agent_data in reports:
-                agent = agent_data.get("agent", {})
-                name = agent.get("name") or agent.get("available_name")
-                # Суммируем обработанные тикеты
-                metric_count = agent_data.get("conversations_count", 0)
-                if name and metric_count > 0:
-                    stats[name] = metric_count
-            if stats:
-                return stats
-    except Exception as e:
-        logger.warning(f"Reports API unavailable, falling back to direct fetching: {e}")
-
-    # Резервный метод: сбор диалогов вручную
-    all_convs = []
-    for st in ["open", "resolved", "pending"]:
-        all_convs.extend(fetch_conversations_paginated(st))
-    
-    unique_convs = {c["id"]: c for c in all_convs}
-    
-    stats: Dict[str, int] = {}
-    for conv in unique_convs.values():
-        assignee = conv.get("meta", {}).get("assignee")
-        if assignee:
-            name = assignee.get("name", "Без имени").strip()
-            stats[name] = stats.get(name, 0) + 1
-
-    return stats
-
 
 def get_conversation_messages(conversation_id: int):
     url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -132,7 +119,19 @@ def get_conversation_messages(conversation_id: int):
         logger.error(f"Error fetching messages: {e}")
     return []
 
+def sync_active_conversations():
+    """Синхронизация активных и закрытых тикетов из API в локальную базу."""
+    for status in ["open", "resolved", "pending"]:
+        convs = fetch_conversations_paginated(status)
+        for conv in convs:
+            conv_id = conv.get("id")
+            assignee = conv.get("meta", {}).get("assignee")
+            if conv_id and assignee:
+                name = assignee.get("name")
+                if name:
+                    record_conversation_assignee(conv_id, name.strip())
 
+# ================== ПРОВЕРКА ТАЙМАУТОВ ==================
 async def check_waiting_tickets():
     logger.info("Checking waiting tickets...")
     conversations = fetch_conversations_paginated("open")
@@ -145,6 +144,9 @@ async def check_waiting_tickets():
         assignee = conv.get("meta", {}).get("assignee")
         assignee_name = assignee.get("name") if assignee else "Не назначен"
 
+        if assignee and assignee.get("name"):
+            record_conversation_assignee(conv_id, assignee.get("name").strip())
+
         is_ira = "ира" in assignee_name.lower() or "ira" in assignee_name.lower()
         required_wait_minutes = IRA_WAITING_MINUTES if is_ira else WAITING_MINUTES
 
@@ -155,7 +157,7 @@ async def check_waiting_tickets():
         last_msg = messages[-1]
         msg_type = last_msg.get("message_type")
 
-        if msg_type == 0:  # Сообщение от клиента
+        if msg_type == 0:  # Клиент
             created_at = last_msg.get("created_at")
             if not created_at:
                 continue
@@ -174,52 +176,55 @@ async def check_waiting_tickets():
                 try:
                     await telegram_app.bot.send_message(chat_id=NOTIFY_CHAT_ID, text=text, parse_mode="HTML")
                     already_notified.add(conv_id)
-                    logger.info(f"Notification sent for conversation {conv_id}")
                 except Exception as e:
                     logger.error(f"Telegram send error: {e}")
 
-        elif msg_type == 1 and conv_id in already_notified:  # Ответ оператора
+        elif msg_type == 1 and conv_id in already_notified:
             already_notified.discard(conv_id)
 
-
+# ================== КОМАНДЫ ТЕЛЕГРАМ ==================
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = get_agent_stats_from_api()
+    # При вызове /stats обновляем текущие тикеты из API
+    sync_active_conversations()
+    
+    data = load_daily_data()
+    assigned_dict = data.get("assigned", {})
 
-    if not stats:
-        await update.message.reply_text("Назначенных тикетов не найдено.", parse_mode="HTML")
+    if not assigned_dict:
+        await update.message.reply_text("За сегодня обработанных тикетов не зафиксировано.", parse_mode="HTML")
         return
 
-    # Находим максимальное количество тикетов у одного оператора (принимаем за 100%)
-    max_tickets = max(stats.values())
+    # Подсчитываем сколько тикетов запомнено за день у каждого оператора
+    stats: Dict[str, int] = {}
+    for conv_id, name in assigned_dict.items():
+        stats[name] = stats.get(name, 0) + 1
+
+    max_tickets = max(stats.values()) if stats else 1
     total_assigned = sum(stats.values())
 
-    lines = ["📊 <b>Статистика по операторам (активные + завершённые):</b>\n"]
-    
+    lines = ["📊 <b>Запомненная статистика за день (включая снятые/закрытые):</b>\n"]
     sorted_stats = sorted(stats.items(), key=lambda x: -x[1])
-    
+
     for name, count in sorted_stats:
-        # Расчет процента относительно лидера
-        relative_pct = (count / max_tickets) * 100 if max_tickets > 0 else 0
+        relative_pct = (count / max_tickets) * 100
         lines.append(f"• <b>{name}</b>: <b>{count}</b> ({relative_pct:.1f}%)")
 
-    lines.append(f"\nВсего обработано тикетов: <b>{total_assigned}</b>")
+    lines.append(f"\nВсего зарегистрировано за день: <b>{total_assigned}</b>")
     text = "\n".join(lines)
 
     await update.message.reply_text(text, parse_mode="HTML")
-
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот мониторинга Chatwoot.\n\n"
         "Команды:\n"
-        "/stats — общая статистика по назначенным тикетам"
+        "/stats — статистика за день (с учётом снятых и закрытых)"
     )
-
 
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("stats", stats_command))
 
-
+# ================== WEBHOOKS ==================
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -227,19 +232,31 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return Response(status_code=200)
 
-
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request):
-    data = await request.json()
-    event = data.get("event")
-    logger.info(f"Chatwoot webhook: {event}")
-    return {"ok": True}
+    """Принимает изменения статусов и назначений от Chatwoot в реальном времени."""
+    try:
+        data = await request.json()
+        event = data.get("event")
+        
+        # Перехватываем создание сообщений или обновление диалога
+        if event in ["conversation_created", "conversation_updated", "message_created"]:
+            conv_id = data.get("id") or data.get("conversation", {}).get("id")
+            meta = data.get("meta", {}) or data.get("conversation", {}).get("meta", {})
+            assignee = meta.get("assignee")
+            
+            if conv_id and assignee:
+                name = assignee.get("name")
+                if name:
+                    record_conversation_assignee(conv_id, name.strip())
+    except Exception as e:
+        logger.error(f"Error handling Chatwoot webhook: {e}")
 
+    return {"ok": True}
 
 @app.get("/")
 async def root():
     return {"status": "Bot is running", "bot": "@Neadoribot"}
-
 
 @app.on_event("startup")
 async def on_startup():
@@ -248,19 +265,15 @@ async def on_startup():
 
     webhook_url = f"{WEBHOOK_URL}/telegram"
     await telegram_app.bot.set_webhook(url=webhook_url)
-    logger.info(f"Telegram webhook set to: {webhook_url}")
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_waiting_tickets, "interval", seconds=CHECK_INTERVAL)
     scheduler.start()
-    logger.info("Scheduler started")
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await telegram_app.stop()
     await telegram_app.shutdown()
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
