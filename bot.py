@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Set
+from typing import Dict, Set, List
 
 import requests
 from fastapi import FastAPI, Request, Response
@@ -40,38 +40,47 @@ headers = {
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
-def get_conversations(status: str = "all"):
-    """
-    Получение списка диалогов Chatwoot.
-    status: 'open', 'resolved', 'pending' или 'all'
-    """
+def fetch_conversations_by_status(status: str) -> List[dict]:
+    """Получает все диалоги по конкретному статусу с учетом пагинации."""
     url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations"
     params = {"status": status, "assignee_type": "all", "page": 1}
-    all_conversations = []
+    conversations = []
 
     while True:
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code != 200:
-                logger.error(f"Chatwoot error: {resp.status_code} - {resp.text}")
+                logger.error(f"Chatwoot error for status {status}: {resp.status_code} - {resp.text}")
                 break
 
             data = resp.json()
-            conversations = data.get("data", {}).get("payload", [])
-            if not conversations:
+            payload = data.get("data", {}).get("payload", [])
+            if not payload:
                 break
 
-            all_conversations.extend(conversations)
+            conversations.extend(payload)
 
             meta = data.get("data", {}).get("meta", {})
             if not meta.get("next_page"):
                 break
             params["page"] += 1
         except Exception as e:
-            logger.error(f"Error fetching conversations: {e}")
+            logger.error(f"Error fetching conversations ({status}): {e}")
             break
 
-    return all_conversations
+    return conversations
+
+
+def get_all_conversations() -> List[dict]:
+    """Запрашивает open, resolved и pending тикеты для полной точности."""
+    all_convs = []
+    # Chatwoot более надежно отдает данные, если запрашивать статусы явно
+    for status in ["open", "resolved", "pending"]:
+        all_convs.extend(fetch_conversations_by_status(status))
+    
+    # Удаляем возможные дубликаты по id
+    unique_convs = {conv["id"]: conv for conv in all_convs}
+    return list(unique_convs.values())
 
 
 def get_conversation_messages(conversation_id: int):
@@ -87,7 +96,8 @@ def get_conversation_messages(conversation_id: int):
 
 async def check_waiting_tickets():
     logger.info("Checking waiting tickets...")
-    conversations = get_conversations(status="open")
+    # Для алертов проверяем только открытые тикеты
+    conversations = fetch_conversations_by_status("open")
     now = datetime.now(timezone.utc)
 
     for conv in conversations:
@@ -97,7 +107,7 @@ async def check_waiting_tickets():
         assignee = conv.get("meta", {}).get("assignee")
         assignee_name = assignee.get("name") if assignee else "Не назначен"
 
-        # Определение лимита ожидания (5 мин для Иры, 10 мин для остальных)
+        # Лимит ожидания: 5 минут для Иры, 10 минут для остальных
         is_ira = "ира" in assignee_name.lower() or "ira" in assignee_name.lower()
         required_wait_minutes = IRA_WAITING_MINUTES if is_ira else WAITING_MINUTES
 
@@ -136,7 +146,7 @@ async def check_waiting_tickets():
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conversations = get_conversations(status="all")
+    conversations = get_all_conversations()
     
     stats: Dict[str, int] = {}
     unassigned = 0
@@ -154,7 +164,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if total_tickets == 0:
         text = "Тикетов в системе не найдено."
     else:
-        lines = ["📊 <b>Статистика по всем тикетам:</b>\n"]
+        lines = ["📊 <b>Общая статистика (активные + завершённые):</b>\n"]
         
         sorted_stats = sorted(stats.items(), key=lambda x: -x[1])
         
@@ -176,7 +186,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот мониторинга Chatwoot.\n\n"
         "Команды:\n"
-        "/stats — сводка по всем тикетам"
+        "/stats — общая статистика по всем тикетам"
     )
 
 
