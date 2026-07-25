@@ -16,7 +16,7 @@ CHATWOOT_ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID", "1")
 CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "1498669791")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://chat-2qjr.onrender.com")  # твой адрес на Render
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://chat-2qjr.onrender.com")
 
 WAITING_MINUTES = 10
 CHECK_INTERVAL = 60
@@ -37,7 +37,6 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Telegram Application
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
@@ -160,14 +159,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# Регистрируем команды
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("stats", stats_command))
 
 
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
-    """Принимаем обновления от Telegram"""
     data = await request.json()
     update = Update.de_json(data, bot)
     await telegram_app.process_update(update)
@@ -189,7 +186,10 @@ async def root():
 
 @app.on_event("startup")
 async def on_startup():
-    # Устанавливаем вебхук Telegram
+    # Важно: инициализируем Application
+    await telegram_app.initialize()
+    
+    # Устанавливаем вебхук
     webhook_url = f"{WEBHOOK_URL}/telegram"
     await bot.set_webhook(url=webhook_url)
     logger.info(f"Telegram webhook set to: {webhook_url}")
