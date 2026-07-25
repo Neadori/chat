@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Set
 import threading
+import asyncio
 
 import requests
 from fastapi import FastAPI, Request
@@ -30,8 +31,11 @@ bot = Bot(token=TELEGRAM_TOKEN)
 
 already_notified: Set[int] = set()
 
+# Несколько вариантов заголовка — чтобы обойти Nginx
 headers = {
     "api_access_token": CHATWOOT_TOKEN,
+    "api-access-token": CHATWOOT_TOKEN,
+    "Api-Access-Token": CHATWOOT_TOKEN,
     "Content-Type": "application/json"
 }
 
@@ -169,7 +173,6 @@ async def root():
 
 
 def run_telegram_bot():
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
