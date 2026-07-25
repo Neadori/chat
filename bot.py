@@ -2,11 +2,9 @@ import os
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Set
-import threading
-import asyncio
 
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,6 +16,7 @@ CHATWOOT_ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID", "1")
 CHATWOOT_TOKEN = os.getenv("CHATWOOT_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID", "1498669791")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://chat-2qjr.onrender.com")  # твой адрес на Render
 
 WAITING_MINUTES = 10
 CHECK_INTERVAL = 60
@@ -31,13 +30,15 @@ bot = Bot(token=TELEGRAM_TOKEN)
 
 already_notified: Set[int] = set()
 
-# Несколько вариантов заголовка — чтобы обойти Nginx
 headers = {
     "api_access_token": CHATWOOT_TOKEN,
     "api-access-token": CHATWOOT_TOKEN,
     "Api-Access-Token": CHATWOOT_TOKEN,
     "Content-Type": "application/json"
 }
+
+# Telegram Application
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
 def get_open_conversations():
@@ -95,9 +96,9 @@ def check_waiting_tickets():
             continue
 
         last_msg = messages[-1]
-        msg_type = last_msg.get("message_type")  # 0 = incoming, 1 = outgoing
+        msg_type = last_msg.get("message_type")
 
-        if msg_type == 0:  # последнее сообщение от клиента
+        if msg_type == 0:
             created_at = last_msg.get("created_at")
             if not created_at:
                 continue
@@ -159,11 +160,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Регистрируем команды
+telegram_app.add_handler(CommandHandler("start", start_command))
+telegram_app.add_handler(CommandHandler("stats", stats_command))
+
+
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    """Принимаем обновления от Telegram"""
+    data = await request.json()
+    update = Update.de_json(data, bot)
+    await telegram_app.process_update(update)
+    return Response(status_code=200)
+
+
 @app.post("/webhook/chatwoot")
 async def chatwoot_webhook(request: Request):
     data = await request.json()
     event = data.get("event")
-    logger.info(f"Webhook received: {event}")
+    logger.info(f"Chatwoot webhook: {event}")
     return {"ok": True}
 
 
@@ -172,25 +187,20 @@ async def root():
     return {"status": "Bot is running", "bot": "@Neadoribot"}
 
 
-def run_telegram_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+@app.on_event("startup")
+async def on_startup():
+    # Устанавливаем вебхук Telegram
+    webhook_url = f"{WEBHOOK_URL}/telegram"
+    await bot.set_webhook(url=webhook_url)
+    logger.info(f"Telegram webhook set to: {webhook_url}")
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.run_polling(drop_pending_updates=True, close_loop=False)
-
-
-if __name__ == "__main__":
     # Запускаем проверку тикетов
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_waiting_tickets, "interval", seconds=CHECK_INTERVAL)
     scheduler.start()
+    logger.info("Scheduler started")
 
-    # Запускаем Telegram-бота в отдельном потоке
-    threading.Thread(target=run_telegram_bot, daemon=True).start()
 
-    # Запускаем веб-сервер
+if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
