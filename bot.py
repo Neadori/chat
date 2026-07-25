@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Set, List
 
 import requests
@@ -22,10 +22,10 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://chat-2qjr.onrender.com")
 WAITING_MINUTES = 10       # Время ожидания для всех (мин)
 IRA_WAITING_MINUTES = 5    # Время ожидания для Иры (мин)
 CHECK_INTERVAL = 60
-STATS_FILE = "daily_stats.json"
+STATS_FILE = "weekend_stats.json"
 
-# Список операторов, которых нужно ИСКЛЮЧИТЬ из статистики и алертов
 EXCLUDED_OPERATORS = ["тёма", "тема", "андрей с2"]
+MSK = timezone(timedelta(hours=3))
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -46,28 +46,54 @@ telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
 def is_excluded(operator_name: str) -> bool:
-    """Проверяет, входит ли оператор в список исключенных."""
     if not operator_name:
         return True
     name_clean = operator_name.strip().lower()
     return any(excluded in name_clean for excluded in EXCLUDED_OPERATORS)
 
 
-# ================== РАБОТА С БАЗОЙ ДАННЫХ ДНЯ ==================
-def load_daily_data() -> dict:
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def get_current_shift_key() -> str:
+    """
+    Определяет ключ текущей смены.
+    Суббота (с 09:00 MSK) и воскресенье (до 01:00 MSK понедельника) 
+    объединяются в единый рабочий период.
+    """
+    now_msk = datetime.now(MSK)
+    
+    # Если наступил понедельник до 01:00 ночи MSK — это всё ещё смена воскресенья
+    if now_msk.weekday() == 0 and now_msk.hour < 1:
+        shift_start = now_msk - timedelta(days=2) # Суббота
+    elif now_msk.weekday() == 1 and now_msk.hour < 1: # Вторник до 01:00 -> Воскресенье/Понедельник
+        shift_start = now_msk - timedelta(days=1)
+    elif now_msk.hour < 1:
+        shift_start = now_msk - timedelta(days=1)
+    else:
+        shift_start = now_msk
+
+    # Для субботы и воскресенья возвращаем единый ключ выходных
+    if shift_start.weekday() in [5, 6]:
+        # Находим дату субботы этой недели
+        saturday = shift_start - timedelta(days=(shift_start.weekday() - 5))
+        return f"weekend_{saturday.strftime('%Y-%m-%d')}"
+    
+    return f"day_{shift_start.strftime('%Y-%m-%d')}"
+
+
+# ================== РАБОТА С БАЗОЙ ДАННЫХ ==================
+def load_data() -> dict:
+    shift_key = get_current_shift_key()
     if os.path.exists(STATS_FILE):
         try:
             with open(STATS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if data.get("date") == today_str:
+                if data.get("shift_key") == shift_key:
                     return data
         except Exception as e:
             logger.error(f"Error loading stats file: {e}")
-    return {"date": today_str, "assigned": {}}
+    return {"shift_key": shift_key, "assigned": {}}
 
 
-def save_daily_data(data: dict):
+def save_data(data: dict):
     try:
         with open(STATS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -79,17 +105,17 @@ def record_conversation_assignee(conv_id: int, assignee_name: str):
     if not assignee_name or assignee_name in ["Не назначен", "Без имени"]:
         return
     
-    # Игнорируем операторов из черного списка
     if is_excluded(assignee_name):
         return
 
-    data = load_daily_data()
+    data = load_data()
     conv_str = str(conv_id)
     
-    if data["assigned"].get(conv_str) != assignee_name:
-        data["assigned"][conv_str] = assignee_name
-        save_daily_data(data)
-        logger.info(f"Recorded ticket #{conv_id} for operator '{assignee_name}'")
+    name_clean = assignee_name.strip()
+    if data["assigned"].get(conv_str) != name_clean:
+        data["assigned"][conv_str] = name_clean
+        save_data(data)
+        logger.info(f"Recorded ticket #{conv_id} for operator '{name_clean}'")
 
 
 # ================== CHATWOOT API ==================
@@ -142,7 +168,7 @@ def get_conversation_messages(conversation_id: int):
 
 
 def sync_active_conversations():
-    """Синхронизация активных и закрытых тикетов из API в локальную базу."""
+    """Синхронизирует все активные и завершённые тикеты."""
     for status in ["open", "resolved", "pending"]:
         convs = fetch_conversations_paginated(status)
         for conv in convs:
@@ -167,7 +193,6 @@ async def check_waiting_tickets():
         assignee = conv.get("meta", {}).get("assignee")
         assignee_name = assignee.get("name") if assignee else "Не назначен"
 
-        # Игнорируем тикеты исключенных операторов
         if is_excluded(assignee_name):
             continue
 
@@ -184,7 +209,7 @@ async def check_waiting_tickets():
         last_msg = messages[-1]
         msg_type = last_msg.get("message_type")
 
-        if msg_type == 0:  # Клиент
+        if msg_type == 0:  # Сообщение клиента
             created_at = last_msg.get("created_at")
             if not created_at:
                 continue
@@ -214,30 +239,29 @@ async def check_waiting_tickets():
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sync_active_conversations()
     
-    data = load_daily_data()
+    data = load_data()
     assigned_dict = data.get("assigned", {})
 
-    # Дополнительная фильтрация базы данных
     filtered_stats: Dict[str, int] = {}
     for conv_id, name in assigned_dict.items():
         if not is_excluded(name):
             filtered_stats[name] = filtered_stats.get(name, 0) + 1
 
     if not filtered_stats:
-        await update.message.reply_text("За сегодня обработанных тикетов не зафиксировано.", parse_mode="HTML")
+        await update.message.reply_text("За текущую смену обработанных тикетов не зафиксировано.", parse_mode="HTML")
         return
 
     max_tickets = max(filtered_stats.values()) if filtered_stats else 1
     total_assigned = sum(filtered_stats.values())
 
-    lines = ["📊 <b>Запомненная статистика за день (включая снятые/закрытые):</b>\n"]
+    lines = ["📊 <b>Статистика за смену (выходные 25.07 – 26.07):</b>\n"]
     sorted_stats = sorted(filtered_stats.items(), key=lambda x: -x[1])
 
     for name, count in sorted_stats:
         relative_pct = (count / max_tickets) * 100
         lines.append(f"• <b>{name}</b>: <b>{count}</b> ({relative_pct:.1f}%)")
 
-    lines.append(f"\nВсего зарегистрировано за день: <b>{total_assigned}</b>")
+    lines.append(f"\nВсего зарегистрировано тикетов: <b>{total_assigned}</b>")
     text = "\n".join(lines)
 
     await update.message.reply_text(text, parse_mode="HTML")
@@ -247,7 +271,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот мониторинга Chatwoot.\n\n"
         "Команды:\n"
-        "/stats — статистика за день (с учётом снятых и закрытых)"
+        "/stats — статистика за двухдневную смену"
     )
 
 
