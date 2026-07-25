@@ -5,7 +5,7 @@ from typing import Dict, Set
 
 import requests
 from fastapi import FastAPI, Request, Response
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
@@ -26,7 +26,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-bot = Bot(token=TELEGRAM_TOKEN)
 
 already_notified: Set[int] = set()
 
@@ -37,6 +36,7 @@ headers = {
     "Content-Type": "application/json"
 }
 
+# Создаём Application один раз
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
@@ -78,7 +78,7 @@ def get_conversation_messages(conversation_id: int):
     return []
 
 
-def check_waiting_tickets():
+async def check_waiting_tickets():
     logger.info("Checking waiting tickets...")
     conversations = get_open_conversations()
     now = datetime.now(timezone.utc)
@@ -114,7 +114,9 @@ def check_waiting_tickets():
                     f"ID: <code>{conv_id}</code>"
                 )
                 try:
-                    bot.send_message(chat_id=NOTIFY_CHAT_ID, text=text, parse_mode="HTML")
+                    await telegram_app.bot.send_message(
+                        chat_id=NOTIFY_CHAT_ID, text=text, parse_mode="HTML"
+                    )
                     already_notified.add(conv_id)
                     logger.info(f"Notification sent for conversation {conv_id}")
                 except Exception as e:
@@ -166,7 +168,7 @@ telegram_app.add_handler(CommandHandler("stats", stats_command))
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    update = Update.de_json(data, bot)
+    update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return Response(status_code=200)
 
@@ -186,19 +188,23 @@ async def root():
 
 @app.on_event("startup")
 async def on_startup():
-    # Важно: инициализируем Application
     await telegram_app.initialize()
-    
-    # Устанавливаем вебхук
+    await telegram_app.start()
+
     webhook_url = f"{WEBHOOK_URL}/telegram"
-    await bot.set_webhook(url=webhook_url)
+    await telegram_app.bot.set_webhook(url=webhook_url)
     logger.info(f"Telegram webhook set to: {webhook_url}")
 
-    # Запускаем проверку тикетов
     scheduler = BackgroundScheduler()
     scheduler.add_job(check_waiting_tickets, "interval", seconds=CHECK_INTERVAL)
     scheduler.start()
     logger.info("Scheduler started")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await telegram_app.stop()
+    await telegram_app.shutdown()
 
 
 if __name__ == "__main__":
