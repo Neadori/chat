@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Set
+from typing import Dict, Set, Any
 
 import requests
 from fastapi import FastAPI, Request, Response
@@ -26,6 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
 already_notified: Set[int] = set()
 
 headers = {
@@ -38,66 +39,160 @@ headers = {
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
-def get_open_conversations():
-    # Пробуем несколько вариантов URL
-    urls_to_try = [
-        f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations?status=open",
-        f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations",
-        f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations?status=open&assignee_type=all",
-    ]
+def get_conversations(status: str = "all"):
+    """
+    Получение списка диалогов Chatwoot.
+    status: 'open', 'resolved', 'pending' или 'all'
+    """
+    url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations"
+    params = {"status": status, "assignee_type": "all", "page": 1}
+    all_conversations = []
 
-    for url in urls_to_try:
-        logger.info(f"Trying URL: {url}")
+    while True:
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            logger.info(f"Status: {resp.status_code} | Response: {resp.text[:300]}")
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                conversations = data.get("data", {}).get("payload", [])
-                logger.info(f"Found {len(conversations)} conversations")
-                return conversations
-        except Exception as e:
-            logger.error(f"Error: {e}")
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code != 200:
+                logger.error(f"Chatwoot error: {resp.status_code} - {resp.text}")
+                break
 
+            data = resp.json()
+            conversations = data.get("data", {}).get("payload", [])
+            if not conversations:
+                break
+
+            all_conversations.extend(conversations)
+
+            meta = data.get("data", {}).get("meta", {})
+            if not meta.get("next_page"):
+                break
+            params["page"] += 1
+        except Exception as e:
+            logger.error(f"Error fetching conversations: {e}")
+            break
+
+    return all_conversations
+
+
+def get_conversation_messages(conversation_id: int):
+    url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("payload", [])
+    except Exception as e:
+        logger.error(f"Error fetching messages: {e}")
     return []
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conversations = get_open_conversations()
-    
-    if not conversations:
-        await update.message.reply_text("Не удалось получить тикеты из Chatwoot")
-        return
-
-    stats: Dict[str, int] = {}
+async def check_waiting_tickets():
+    logger.info("Checking waiting tickets...")
+    # Для алертов проверяем только открытые тикеты
+    conversations = get_conversations(status="open")
+    now = datetime.now(timezone.utc)
 
     for conv in conversations:
+        conv_id = conv.get("id")
+        display_id = conv.get("display_id") or conv_id
+        contact_name = conv.get("meta", {}).get("sender", {}).get("name", "Клиент")
         assignee = conv.get("meta", {}).get("assignee")
+        assignee_name = assignee.get("name") if assignee else "Не назначен"
+
+        messages = get_conversation_messages(conv_id)
+        if not messages:
+            continue
+
+        last_msg = messages[-1]
+        msg_type = last_msg.get("message_type")
+
+        if msg_type == 0:  # Сообщение от клиента
+            created_at = last_msg.get("created_at")
+            if not created_at:
+                continue
+
+            msg_time = datetime.fromtimestamp(created_at, tz=timezone.utc)
+            minutes_waiting = (now - msg_time).total_seconds() / 60
+
+            if minutes_waiting >= WAITING_MINUTES and conv_id not in already_notified:
+                text = (
+                    f"⚠️ <b>Тикет ждёт ответа уже {int(minutes_waiting)} мин.</b>\n\n"
+                    f"Клиент: <b>{contact_name}</b>\n"
+                    f"Диалог: #{display_id}\n"
+                    f"Назначен: <b>{assignee_name}</b>\n"
+                    f"ID: <code>{conv_id}</code>"
+                )
+                try:
+                    await telegram_app.bot.send_message(chat_id=NOTIFY_CHAT_ID, text=text, parse_mode="HTML")
+                    already_notified.add(conv_id)
+                    logger.info(f"Notification sent for conversation {conv_id}")
+                except Exception as e:
+                    logger.error(f"Telegram send error: {e}")
+
+        elif msg_type == 1 and conv_id in already_notified:  # Ответ оператора
+            already_notified.discard(conv_id)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Получаем абсолютно все тикеты (open, resolved, pending)
+    conversations = get_conversations(status="all")
+    
+    # Структура: { "Имя": {"open": 0, "resolved": 0, "total": 0} }
+    stats: Dict[str, Dict[str, int]] = {}
+    unassigned_open = 0
+    unassigned_resolved = 0
+
+    for conv in conversations:
+        status = conv.get("status", "open")
+        assignee = conv.get("meta", {}).get("assignee")
+
         if assignee:
             name = assignee.get("name", "Без имени")
-            stats[name] = stats.get(name, 0) + 1
+            if name not in stats:
+                stats[name] = {"open": 0, "resolved": 0, "total": 0}
+            
+            stats[name]["total"] += 1
+            if status == "resolved":
+                stats[name]["resolved"] += 1
+            else:
+                stats[name]["open"] += 1
+        else:
+            if status == "resolved":
+                unassigned_resolved += 1
+            else:
+                unassigned_open += 1
 
-    total = sum(stats.values())
+    total_tickets = len(conversations)
 
-    if total == 0:
-        await update.message.reply_text("Нет открытых назначенных тикетов 🎉")
-        return
+    if total_tickets == 0:
+        text = "Тикетов в системе не найдено."
+    else:
+        lines = ["📊 <b>Статистика по всем тикетам:</b>\n"]
+        
+        # Сортируем по общему количеству тикетов
+        sorted_stats = sorted(stats.items(), key=lambda x: -x[1]["total"])
+        
+        for name, counts in sorted_stats:
+            lines.append(
+                f"• <b>{name}</b>: Всего <b>{counts['total']}</b> "
+                f"(🟢 Открыто: {counts['open']} | ✅ Закрыто: {counts['resolved']})"
+            )
 
-    lines = [f"📊 <b>Открытые тикеты ({total}):</b>\n"]
-    
-    for name, count in sorted(stats.items(), key=lambda x: -x[1]):
-        percent = round(count / total * 100)
-        lines.append(f"• {name}: <b>{count}</b> ({percent}%)")
+        if unassigned_open or unassigned_resolved:
+            lines.append(
+                f"\n• <b>Не назначены</b>: "
+                f"(🟢 Открыто: {unassigned_open} | ✅ Закрыто: {unassigned_resolved})"
+            )
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        lines.append(f"\nВсего тикетов в базе: <b>{total_tickets}</b>")
+        text = "\n".join(lines)
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот мониторинга Chatwoot.\n\n"
         "Команды:\n"
-        "/stats — статистика по тикетам"
+        "/stats — сводка по всем тикетам (открытым и закрытым)"
     )
 
 
@@ -113,17 +208,32 @@ async def telegram_webhook(request: Request):
     return Response(status_code=200)
 
 
+@app.post("/webhook/chatwoot")
+async def chatwoot_webhook(request: Request):
+    data = await request.json()
+    event = data.get("event")
+    logger.info(f"Chatwoot webhook: {event}")
+    return {"ok": True}
+
+
 @app.get("/")
 async def root():
-    return {"status": "Bot is running"}
+    return {"status": "Bot is running", "bot": "@Neadoribot"}
 
 
 @app.on_event("startup")
 async def on_startup():
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/telegram")
-    logger.info("Bot started")
+
+    webhook_url = f"{WEBHOOK_URL}/telegram"
+    await telegram_app.bot.set_webhook(url=webhook_url)
+    logger.info(f"Telegram webhook set to: {webhook_url}")
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(check_waiting_tickets, "interval", seconds=CHECK_INTERVAL)
+    scheduler.start()
+    logger.info("Scheduler started")
 
 
 @app.on_event("shutdown")
