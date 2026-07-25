@@ -41,12 +41,13 @@ telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
 def fetch_conversations_by_status(status: str) -> List[dict]:
-    """Получает все диалоги по конкретному статусу с учетом пагинации."""
+    """Получает ВСЕ диалоги по статусу, полностью проходя по всем страницам пагинации."""
     url = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT_ID}/conversations"
-    params = {"status": status, "assignee_type": "all", "page": 1}
+    page = 1
     conversations = []
 
     while True:
+        params = {"status": status, "assignee_type": "all", "page": page}
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=15)
             if resp.status_code != 200:
@@ -54,31 +55,43 @@ def fetch_conversations_by_status(status: str) -> List[dict]:
                 break
 
             data = resp.json()
-            payload = data.get("data", {}).get("payload", [])
+            # Обработка разных структур ответа Chatwoot
+            payload = []
+            meta = {}
+            
+            if isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], dict):
+                    payload = data["data"].get("payload", [])
+                    meta = data["data"].get("meta", {})
+                elif "payload" in data:
+                    payload = data.get("payload", [])
+                    meta = data.get("meta", {})
+            
             if not payload:
                 break
 
             conversations.extend(payload)
 
-            meta = data.get("data", {}).get("meta", {})
-            if not meta.get("next_page"):
+            # Проверяем наличие следующей страницы
+            next_page = meta.get("next_page") or meta.get("pages_count", 0) > page
+            if not next_page:
                 break
-            params["page"] += 1
+            
+            page += 1
+
         except Exception as e:
-            logger.error(f"Error fetching conversations ({status}): {e}")
+            logger.error(f"Error fetching conversations ({status}, page {page}): {e}")
             break
 
     return conversations
 
 
 def get_all_conversations() -> List[dict]:
-    """Запрашивает open, resolved и pending тикеты для полной точности."""
+    """Собирает открытые, завершённые и ожидания тикеты без дубликатов."""
     all_convs = []
-    # Chatwoot более надежно отдает данные, если запрашивать статусы явно
     for status in ["open", "resolved", "pending"]:
         all_convs.extend(fetch_conversations_by_status(status))
     
-    # Удаляем возможные дубликаты по id
     unique_convs = {conv["id"]: conv for conv in all_convs}
     return list(unique_convs.values())
 
@@ -96,7 +109,6 @@ def get_conversation_messages(conversation_id: int):
 
 async def check_waiting_tickets():
     logger.info("Checking waiting tickets...")
-    # Для алертов проверяем только открытые тикеты
     conversations = fetch_conversations_by_status("open")
     now = datetime.now(timezone.utc)
 
@@ -107,7 +119,6 @@ async def check_waiting_tickets():
         assignee = conv.get("meta", {}).get("assignee")
         assignee_name = assignee.get("name") if assignee else "Не назначен"
 
-        # Лимит ожидания: 5 минут для Иры, 10 минут для остальных
         is_ira = "ира" in assignee_name.lower() or "ira" in assignee_name.lower()
         required_wait_minutes = IRA_WAITING_MINUTES if is_ira else WAITING_MINUTES
 
@@ -149,34 +160,27 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversations = get_all_conversations()
     
     stats: Dict[str, int] = {}
-    unassigned = 0
+    total_assigned_tickets = 0
 
     for conv in conversations:
         assignee = conv.get("meta", {}).get("assignee")
         if assignee:
-            name = assignee.get("name", "Без имени")
+            name = assignee.get("name", "Без имени").strip()
             stats[name] = stats.get(name, 0) + 1
-        else:
-            unassigned += 1
+            total_assigned_tickets += 1
 
-    total_tickets = len(conversations)
-
-    if total_tickets == 0:
-        text = "Тикетов в системе не найдено."
+    if total_assigned_tickets == 0:
+        text = "Назначенных тикетов не найдено."
     else:
         lines = ["📊 <b>Общая статистика (активные + завершённые):</b>\n"]
         
         sorted_stats = sorted(stats.items(), key=lambda x: -x[1])
         
         for name, count in sorted_stats:
-            percentage = (count / total_tickets) * 100
+            percentage = (count / total_assigned_tickets) * 100
             lines.append(f"• <b>{name}</b>: <b>{count}</b> ({percentage:.1f}%)")
 
-        if unassigned:
-            unassigned_pct = (unassigned / total_tickets) * 100
-            lines.append(f"• <b>Не назначены</b>: <b>{unassigned}</b> ({unassigned_pct:.1f}%)")
-
-        lines.append(f"\nВсего тикетов: <b>{total_tickets}</b>")
+        lines.append(f"\nВсего назначенных тикетов: <b>{total_assigned_tickets}</b>")
         text = "\n".join(lines)
 
     await update.message.reply_text(text, parse_mode="HTML")
@@ -186,7 +190,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот мониторинга Chatwoot.\n\n"
         "Команды:\n"
-        "/stats — общая статистика по всем тикетам"
+        "/stats — общая статистика по назначенным тикетам"
     )
 
 
